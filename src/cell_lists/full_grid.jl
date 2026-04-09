@@ -25,7 +25,10 @@ See [`copy_neighborhood_search`](@ref) for more details.
                                        and GPU-compatible.
 - `max_points_per_cell = 100`: Maximum number of points per cell. This will be used to
                                allocate the `DynamicVectorOfVectors`. It is not used with
-                               the `Vector{Vector{Int32}}` backend.
+                               the `Vector{Vector{Int32}}` backend. For sparse grids,
+                               consider using [`estimate_max_points_per_cell`](@ref)
+                               to compute a more memory-efficient value instead of using
+                               the fixed default of 100.
 """
 struct FullGridCellList{C, LI, MINC, MAXC} <: AbstractCellList
     cells          :: C
@@ -79,6 +82,124 @@ function FullGridCellList(; min_corner, max_corner,
     end
 
     return FullGridCellList(cells, linear_indices, min_corner, max_corner)
+end
+
+"""
+    estimate_max_points_per_cell(points::AbstractMatrix, search_radius;
+                                min_corner=nothing, max_corner=nothing,
+                                percentile=1.0, safety_margin=1.2)
+
+Estimate the maximum number of points per cell in a `FullGridCellList` by analyzing
+the point distribution. Only occupied cells are considered.
+
+This function is useful for reducing memory allocation in `FullGridCellList` when
+dealing with sparse grids. Instead of pre-allocating a fixed `max_points_per_cell`
+value, this function determines an adaptive allocation based on actual point density.
+
+# Arguments
+- `points`: Points as a matrix where each column is a point coordinate.
+            Expected shape: `(n_dims, n_points)`.
+- `search_radius`: The search radius for the cell list, which determines cell size.
+- `min_corner`: Lower corner of domain (computed from points if not provided).
+- `max_corner`: Upper corner of domain (computed from points if not provided).
+- `percentile`: Percentile of occupied-cell counts used for the estimate (default `1.0`,
+               i.e. the true maximum). The result must be a **hard upper bound** on the
+               number of points per cell, otherwise `FullGridCellList` will throw a
+               `BoundsError` from `pushat!` during `initialize!`/`update!`. Only lower
+               this value if you know the point distribution will not change and can
+               tolerate occasional violations being caught by `safety_margin`.
+               Range: `(0, 1]`.
+- `safety_margin`: Multiplicative safety margin (default `1.2`) applied on top of the
+                  percentile value. This is the only headroom against future point
+                  movements, so keep it `> 1` whenever the cell list will be reused
+                  via `update!`.
+
+# Returns
+An integer representing the recommended `max_points_per_cell` value.
+
+# Example
+```julia
+points = randn(3, 1000)  # 1000 points in 3D
+search_radius = 0.1
+estimated = estimate_max_points_per_cell(points, search_radius)
+cell_list = FullGridCellList(; min_corner=(-1, -1, -1), max_corner=(1, 1, 1),
+                            search_radius, max_points_per_cell=estimated)
+```
+
+# Notes
+- Returns at least 1 for degenerate cases.
+- For best results, run this once with a representative sample of points and reuse
+  the result, rather than recomputing for every update.
+- The function accounts for the 1.001× padding that `FullGridCellList` adds internally.
+"""
+function estimate_max_points_per_cell(points::AbstractMatrix, search_radius;
+                                     min_corner=nothing, max_corner=nothing,
+                                     percentile=1.0, safety_margin=1.2)
+    if !(0 < percentile <= 1)
+        throw(ArgumentError("percentile must be in the interval (0, 1], got $percentile"))
+    end
+    if size(points, 2) == 0 || search_radius < eps()
+        return 1
+    end
+
+    n_dims = size(points, 1)
+
+    # Compute domain bounds if not provided
+    if min_corner === nothing
+        min_corner = vec(minimum(points, dims=2))
+    end
+    if max_corner === nothing
+        max_corner = vec(maximum(points, dims=2))
+    end
+
+    min_corner_ = SVector(Tuple(min_corner))
+    max_corner_ = SVector(Tuple(max_corner))
+
+    return _estimate_max_points_per_cell(points, search_radius, min_corner_, max_corner_,
+                                         percentile, safety_margin, Val(n_dims))
+end
+
+function _estimate_max_points_per_cell(points, search_radius, min_corner, max_corner,
+                                       percentile, safety_margin, ::Val{NDIMS}) where {NDIMS}
+    n_points = size(points, 2)
+
+    # Add padding like FullGridCellList does internally
+    # `1001 // 1000` is 1.001 without forcing a float type
+    min_corner_padded = min_corner .- 1001 // 1000 * search_radius
+    max_corner_padded = max_corner .+ 1001 // 1000 * search_radius
+
+    n_cells_per_dimension = ceil.(Int, (max_corner_padded .- min_corner_padded) ./ search_radius)
+    lin_indices = LinearIndices(Tuple(n_cells_per_dimension))
+
+    # Use a Dict to only store occupied cells, avoiding a full-grid-sized allocation
+    cell_counts = Dict{Int, Int32}()
+    sizehint!(cell_counts, min(n_points, 1024))
+
+    for i in 1:n_points
+        coords = extract_svector(points, Val(NDIMS), i)
+
+        cell_indices = floor_to_int.((coords .- min_corner_padded) ./ search_radius) .+ 1
+        cell_tuple = Tuple(cell_indices)
+
+        # Only count points within valid cell grid
+        if all(ntuple(d -> 1 <= cell_tuple[d] <= n_cells_per_dimension[d], Val(NDIMS)))
+            cell_idx = lin_indices[cell_tuple...]
+            cell_counts[cell_idx] = get(cell_counts, cell_idx, Int32(0)) + Int32(1)
+        end
+    end
+
+    if isempty(cell_counts)
+        return 1
+    end
+
+    # Collect and sort counts in-place
+    counts = collect(values(cell_counts))
+    sort!(counts)
+
+    idx = clamp(floor(Int, (length(counts) - 1) * percentile) + 1, 1, length(counts))
+    percentile_value = counts[idx]
+
+    return max(1, ceil(Int, percentile_value * safety_margin))
 end
 
 @inline function cell_coords(coords, periodic_box::Nothing, cell_list::FullGridCellList,
